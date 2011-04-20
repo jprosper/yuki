@@ -492,18 +492,20 @@ static inline ysize_t _ypower(ysize_t base, ysize_t expon)
 }
 
 #define YUKI_HASH_KEY_BUF_LEN  64
-static ysize_t _ytable_sql_get_hash_key(const yvar_t * key, ysize_t key_len)
+static ysize_t _ytable_get_hash_key(const yvar_t * key)
 {
     YUKI_ASSERT(key);
     ysize_t hash_key = 0;
     if (yvar_like_int(*key)) {
         ysize_t hk2 = 0;
         yvar_get_uint64(*key, hk2);
-        hash_key = hk2 % _ypower(10, key_len);
+        hash_key = hk2;
         YUKI_LOG_DEBUG("int hash key = '%ld'", hash_key);
     } else if (yvar_like_string(*key)) {
+        // to crc
         char buf[YUKI_HASH_KEY_BUF_LEN] = {0};
         char hk[32] = {0};
+        ysize_t key_len = 19; //max 64 int length for hash
         ysize_t len = yvar_cstr_strlen(*key);
         snprintf(buf, YUKI_HASH_KEY_BUF_LEN, "%s", yvar_cstr_buffer(*key));
         if (key_len > len) {
@@ -582,6 +584,15 @@ static ybool_t _ytable_fecth_hash_key(const ytable_t * ytable, yvar_t ** hash_ke
     return yfalse;
 }
 
+static void _ytable_set_hash_key(ytable_t * ytable)
+{
+    yvar_t * hash_key;
+    if (_ytable_fecth_hash_key(ytable, &hash_key)) {
+        ytable->hash_value = _ytable_get_hash_key(hash_key);
+    }
+    YUKI_LOG_DEBUG("table hash value = '%ld'",ytable->hash_value);
+    return;
+}
 
 
 static ybool_t _ytable_sql_do_build_table(const ytable_t * ytable, char * buffer, ysize_t size, ysize_t * offset)
@@ -592,16 +603,10 @@ static ybool_t _ytable_sql_do_build_table(const ytable_t * ytable, char * buffer
 
     // TODO: implement hash
     if (config->hash_method == YTABLE_HASH_METHOD_KEY_HASH) {
-        yvar_t * the_key;
-        if (!_ytable_fecth_hash_key(ytable, &the_key)) {
-            YUKI_LOG_WARNING("can not get hash key for hash method");
-            return yfalse;
-        }
-
         ysize_t table_length = _ytable_sql_hash_table_length(config);
         ysize_t db_length = _ytable_sql_hash_db_length(config);
         ysize_t db_prefix_length = _ytable_sql_hash_db_prefix_length(config);
-        ysize_t hash_key = _ytable_sql_get_hash_key(the_key, table_length + db_length);
+        ysize_t hash_key = ytable->hash_value;
         if (db_prefix_length > 0) {
             yvar_t db_val = YVAR_CSTR(YTABLE_CONFIG_MEMBER_DB_PREFIX);
             yvar_t db_prefix;
@@ -610,7 +615,7 @@ static ybool_t _ytable_sql_do_build_table(const ytable_t * ytable, char * buffer
             if (db_length > 0) {
                 *offset += snprintf(buffer + *offset, size - *offset,
                             _YTABLE_SQL_QUOT_FIELD "%s%ld" _YTABLE_SQL_QUOT_FIELD _YTABLE_SQL_DOT ,      //db name xx
-                            yvar_cstr_buffer(db_prefix), hash_key/_ypower(10,table_length));
+                            yvar_cstr_buffer(db_prefix), (hash_key / _ypower(10, table_length)) % _ypower(10, db_length));
             } else {
                 *offset += snprintf(buffer + *offset, size - *offset,
                             _YTABLE_SQL_QUOT_FIELD "%s" _YTABLE_SQL_QUOT_FIELD _YTABLE_SQL_DOT ,      //db name
@@ -620,7 +625,7 @@ static ybool_t _ytable_sql_do_build_table(const ytable_t * ytable, char * buffer
 
         *offset += snprintf(buffer + *offset, size - *offset,
                     _YTABLE_SQL_QUOT_FIELD "%s%ld" _YTABLE_SQL_QUOT_FIELD,                     //table name xx
-                    config->name,hash_key);
+                    config->name, hash_key % _ypower(10, db_length + table_length));
 
 
     } else {
@@ -1266,36 +1271,23 @@ static ytable_connection_t * _ytable_fetch_db_connection(ytable_t * ytable)
 
     // FIXME: validate ytable index
     ytable_table_config_t * config = g_ytable_table_configs + ytable->ytable_index;
+
+    // support array
+    ysize_t hash_key = ytable->hash_value;
+    ysize_t array_size = yvar_array_size(*config->connection_index);
+    ysize_t array_index = hash_key % array_size;
     yvar_t connection_index = YVAR_EMPTY();
-    yint32_t array_index = 0;
-
-    // FIXME: support array
-    if (config->hash_method == YTABLE_HASH_METHOD_KEY_HASH) {
-
-        yvar_t * the_key;
-        if (!_ytable_fecth_hash_key(ytable, &the_key)) {
-            YUKI_LOG_WARNING("can not get hash key for hash method");
-            return NULL;
-        }
-        ysize_t table_length = _ytable_sql_hash_table_length(config);
-        ysize_t db_length = _ytable_sql_hash_db_length(config);
-        ysize_t hash_key = _ytable_sql_get_hash_key(the_key, table_length + db_length);
-
-        ysize_t length = yvar_array_size(*config->connection_index);
-        array_index = hash_key % length;
-    }
 
     if (!yvar_array_get(*config->connection_index, array_index, connection_index)) {
         YUKI_LOG_WARNING("invalid connection_index");
         return NULL;
     }
 
-    yint32_t index = 0;
-    if (!yvar_get_int32(connection_index, index)) {
+    yuint32_t index = 0;
+    if (!yvar_get_uint32(connection_index, index)) {
         YUKI_LOG_WARNING("can not get connection index");
         return NULL;
     }
-
     YUKI_ASSERT(index < thread_data->size);
 
     ytable_connection_t * conn = thread_data->connections + index;
@@ -1383,6 +1375,9 @@ static ybool_t _ytable_fetch_internal(ytable_t * ytable, yvar_t ** result, yint3
         // for fetch one, only allow to get up to 2 rows
         local_table.limit = expected_rows + 1;
     }
+
+    //optional parameter for hash key
+    _ytable_set_hash_key(&local_table);
 
     ytable_connection_t * conn = _ytable_fetch_db_connection(&local_table);
 
